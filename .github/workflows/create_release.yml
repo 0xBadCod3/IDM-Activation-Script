@@ -1,0 +1,80 @@
+name: Create Release
+
+on:
+  workflow_run:
+    workflows: ["Get IDM Activation Script"]
+    types:
+      - completed
+  workflow_dispatch:
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check for file changes
+        id: changes
+        run: |
+          CHANGES_DETECTED=false
+          
+          if git diff HEAD^ HEAD --name-only | grep -E '(IASL\.cmd|src/data\.bin|src/dataHlp\.bin|src/extensions\.bin|src/registry\.bin)'; then
+            CHANGES_DETECTED=true
+          fi
+          
+          echo "changes_detected=$CHANGES_DETECTED" >> $GITHUB_OUTPUT
+
+      - name: Get latest version
+        if: steps.changes.outputs.changes_detected == 'true'
+        id: version
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0")
+          VERSION=${LATEST_TAG#v}
+          
+          IFS='.' read -r MAJOR MINOR <<< "$VERSION"
+          
+          if [ "$MAJOR" = "0" ] && [ "$MINOR" = "0" ]; then
+            NEW_VERSION="v1.0"
+          else
+            MINOR=$((MINOR + 1))
+            NEW_VERSION="v${MAJOR}.${MINOR}"
+          fi
+          
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "New version will be: $NEW_VERSION"
+
+      - name: Get current date
+        if: steps.changes.outputs.changes_detected == 'true'
+        id: date
+        run: echo "date=$(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+
+      - name: Create release archive
+        if: steps.changes.outputs.changes_detected == 'true'
+        run: |
+          zip -r IAS-${{ steps.version.outputs.new_version }}.zip \
+            IASL.cmd \
+            src/ \
+            README.md \
+            -x "*.git*"
+
+      - name: Create Release
+        if: steps.changes.outputs.changes_detected == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.new_version }}
+          name: ${{ steps.version.outputs.new_version }}
+          body: |
+            Updated IDM Activation Script files
+            
+            **Date:** ${{ steps.date.outputs.date }}
+
+          files: IAS-${{ steps.version.outputs.new_version }}.zip
+          draft: false
+          prerelease: false
