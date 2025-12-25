@@ -1,0 +1,126 @@
+name: Get IAS
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  get-ias:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download and extract files
+        env:
+          DOWNLOAD_URL: ${{ secrets.DOWNLOAD_URL }}
+        shell: pwsh
+        run: |
+          $webclient = New-Object System.Net.WebClient
+          $webclient.Headers.Add("User-Agent", "Mozilla/5.0")
+          $webclient.DownloadFile($env:DOWNLOAD_URL, "idm-script.zip")
+          $webclient.Dispose()
+          
+          Expand-Archive -Path "idm-script.zip" -DestinationPath . -Force
+          
+          if (-not (Test-Path "IDM-Activation-Script-main")) { exit 1 }
+
+      - name: Calculate file hashes
+        id: hashes
+        run: |
+          mkdir -p .github/hashes
+          cd IDM-Activation-Script-main
+          
+          CHANGES_DETECTED=false
+          CHANGED_FILES=""
+          
+          for file in "IASL.cmd" "src/banner_art.txt" "src/data.bin" "src/dataHlp.bin" "src/extensions.bin" "src/registry.bin"; do
+            if [ -f "$file" ]; then
+              hash_file="../.github/hashes/$(echo $file | tr '/' '_').sha256"
+              new_hash=$(sha256sum "$file" | cut -d' ' -f1)
+              
+              if [ -f "$hash_file" ] && [ "$new_hash" = "$(cat $hash_file)" ]; then
+                continue
+              fi
+              
+              echo "$new_hash" > "$hash_file"
+              CHANGES_DETECTED=true
+              CHANGED_FILES="$CHANGED_FILES$(basename $file) "
+            fi
+          done
+          
+          echo "changes_detected=$CHANGES_DETECTED" >> $GITHUB_OUTPUT
+          echo "changed_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+
+      - name: Scan files with VirusTotal
+        if: steps.hashes.outputs.changes_detected == 'true'
+        continue-on-error: true
+        env:
+          VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          wget -q https://github.com/VirusTotal/vt-cli/releases/download/0.13.0/Linux64.zip
+          unzip -q Linux64.zip
+          chmod +x vt
+          sudo mv vt /usr/local/bin/
+          
+          mkdir -p vt-reports
+          vt init --apikey "$VT_API_KEY"
+          
+          for file in "src/data.bin" "src/dataHlp.bin" "src/extensions.bin" "src/registry.bin"; do
+            filepath="IDM-Activation-Script-main/$file"
+            basename=$(basename "$file")
+            file_hash=$(sha256sum "$filepath" | cut -d' ' -f1)
+            
+            echo "$file_hash" > "vt-reports/${basename}.hash"
+            
+            if ! vt file "$file_hash" > "vt-reports/${basename}.txt" 2>&1; then
+              vt scan file "$filepath" > /dev/null 2>&1
+            fi
+            
+            sleep 5
+          done
+
+      - name: Generate README
+        if: steps.hashes.outputs.changes_detected == 'true'
+        run: |
+          cat > README.md << 'EOF'
+          # IDM Activation Script (Activator + Registry Cleaner)
+          
+          IDM Activation Script is a tool designed to activate Internet Download Manager (IDM) for free, allowing users to bypass trial period restrictions and enjoy the full version without purchasing a license.
+          
+          EOF
+          
+          echo "**Last Updated:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> README.md
+          echo "" >> README.md
+          echo "## VirusTotal Results" >> README.md
+          echo "" >> README.md
+          
+          for filename in "data.bin" "dataHlp.bin" "extensions.bin" "registry.bin"; do
+            hashfile="vt-reports/${filename}.hash"
+            
+            if [ -f "$hashfile" ]; then
+              file_hash=$(cat "$hashfile")
+              echo "- **${filename}**: Report [here](https://www.virustotal.com/gui/file/${file_hash})" >> README.md
+            else
+              echo "- **${filename}**: Scan pending" >> README.md
+            fi
+          done
+
+      - name: Copy files and commit
+        if: steps.hashes.outputs.changes_detected == 'true'
+        run: |
+          mkdir -p src
+          cp IDM-Activation-Script-main/IASL.cmd ./
+          cp IDM-Activation-Script-main/src/*.{txt,bin} ./src/
+          
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add IASL.cmd src/ .github/hashes/ README.md
+          git diff --cached --quiet || git commit -m "Update IAS files"
+          git push
