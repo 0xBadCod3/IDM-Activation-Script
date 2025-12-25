@@ -106,7 +106,7 @@ jobs:
             
             if [ -f "$hashfile" ]; then
               file_hash=$(cat "$hashfile")
-              echo "- **${filename}**: Report [here](https://www.virustotal.com/gui/file/${file_hash})" >> README.md
+              echo "- **${filename}**: Report <a href=\"https://www.virustotal.com/gui/file/${file_hash}\" target=\"_blank\">here</a>" >> README.md
             else
               echo "- **${filename}**: Scan pending" >> README.md
             fi
