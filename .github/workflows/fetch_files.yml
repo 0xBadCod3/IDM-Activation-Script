@@ -1,0 +1,89 @@
+name: Fetch IDM Files
+
+on:
+  schedule:
+    - cron: '0 0 */2 * *'
+  workflow_dispatch:
+    inputs:
+      topic_url:
+        description: 'Topic URL'
+        required: false
+        default: 'https://cs.rin.ru/forum/viewtopic.php?f=14&t=27045'
+      section:
+        description: 'Section keyword to find (e.g. Fix, Patch)'
+        required: false
+        default: 'Fix'
+      author:
+        description: 'Post author'
+        required: false
+        default: 'LuKeStorm'
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch files
+        id: fetch-step
+        run: node .github/scripts/fetch_files.js
+        env:
+          RINRU_USER: ${{ secrets.RINRU_USER }}
+          RINRU_PASS: ${{ secrets.RINRU_PASS }}
+          RINRU_SESSION: ${{ secrets.RINRU_SESSION }}
+          RINRU_TOPIC: ${{ inputs.topic_url || 'https://cs.rin.ru/forum/viewtopic.php?f=14&t=27045' }}
+          RINRU_SECTION: ${{ inputs.section || 'Fix' }}
+          RINRU_AUTHOR: ${{ inputs.author || 'LuKeStorm' }}
+          COOKIE_OUTPUT_FILE: ${{ runner.temp }}/.rin_cookie
+
+      - name: Persist session cookie
+        if: always()
+        run: |
+          COOKIE_FILE="${{ runner.temp }}/.rin_cookie"
+          if [ -f "$COOKIE_FILE" ]; then
+            if [ -n "$PAT_TOKEN" ]; then
+              echo "Updating RINRU_SESSION secret..."
+              gh secret set RINRU_SESSION < "$COOKIE_FILE"
+              echo "RINRU_SESSION secret updated successfully."
+            else
+              echo "Notice: SECRETS_PAT / GH_PAT secret is not configured."
+              echo "The default GITHUB_TOKEN does not have permissions to modify repository secrets."
+              echo "Session was used for this run. To auto-save refreshed session cookies, set a PAT in secrets.SECRETS_PAT."
+            fi
+            rm -f "$COOKIE_FILE"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.SECRETS_PAT || secrets.GH_PAT || '' }}
+          PAT_TOKEN: ${{ secrets.SECRETS_PAT || secrets.GH_PAT || '' }}
+
+      - name: Prune older artifacts
+        if: success()
+        continue-on-error: true
+        run: |
+          echo "Cleaning up older 'idm-download' artifacts from previous runs..."
+          gh api --paginate "/repos/${{ github.repository }}/actions/artifacts" \
+            --jq '.artifacts[] | select(.name == "idm-download") | .id' | while read -r artifact_id; do
+              if [ -n "$artifact_id" ]; then
+                echo "Pruning previous artifact ID: $artifact_id"
+                gh api -X DELETE "/repos/${{ github.repository }}/actions/artifacts/$artifact_id" || true
+              fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: idm-download
+          path: downloads/
+          retention-days: 90
