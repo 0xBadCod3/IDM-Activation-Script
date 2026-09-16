@@ -28,7 +28,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -75,34 +74,11 @@ jobs:
           GH_TOKEN: ${{ secrets.SECRETS_PAT || secrets.GH_PAT || '' }}
           PAT_TOKEN: ${{ secrets.SECRETS_PAT || secrets.GH_PAT || '' }}
 
-      - name: Commit version cache
-        if: steps.fetch-step.outputs.cache_updated == 'true'
+      - name: Commit downloaded file and cache
+        if: steps.fetch-step.outputs.cache_updated == 'true' || steps.fetch-step.outputs.downloaded == 'true'
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add .github/cache/version_cache.json
-          git diff --cached --quiet || git commit -m "Update IDM version cache to ${{ steps.fetch-step.outputs.version }} [skip ci]"
+          git add -A .github/cache/
+          git diff --cached --quiet || git commit -m "Update IDM files and cache to ${{ steps.fetch-step.outputs.version }} [skip ci]"
           git push
-
-      - name: Prune older artifacts
-        if: steps.fetch-step.outputs.downloaded == 'true'
-        continue-on-error: true
-        run: |
-          echo "Cleaning up older 'idm-download' artifacts from previous runs..."
-          gh api --paginate "/repos/${{ github.repository }}/actions/artifacts" \
-            --jq '.artifacts[] | select(.name == "idm-download") | .id' | while read -r artifact_id; do
-              if [ -n "$artifact_id" ]; then
-                echo "Pruning previous artifact ID: $artifact_id"
-                gh api -X DELETE "/repos/${{ github.repository }}/actions/artifacts/$artifact_id" || true
-              fi
-          done
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifact
-        if: steps.fetch-step.outputs.downloaded == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: idm-download
-          path: downloads/
-          retention-days: 90

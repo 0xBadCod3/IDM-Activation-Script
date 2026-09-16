@@ -10,11 +10,13 @@ const { URL } = require('url');
 const TOPIC_URL = process.env.RINRU_TOPIC || 'https://cs.rin.ru/forum/viewtopic.php?f=14&t=27045';
 const POST_AUTHOR = (process.env.RINRU_AUTHOR || 'LuKeStorm').trim();
 const SECTION_KEYWORD = (process.env.RINRU_SECTION || 'Fix').trim();
-const OUTPUT_DIR = process.env.OUTPUT_DIR || path.resolve(__dirname, '..', '..', 'downloads');
+// Storage directories (.github/cache by default)
+const defaultCacheDir = path.resolve(__dirname, '..', 'cache');
+const OUTPUT_DIR = process.env.OUTPUT_DIR || defaultCacheDir;
 const FORCE_FETCH = (process.env.FORCE_FETCH || '').toLowerCase() === 'true';
 
 // Cache file configuration (.github/cache/version_cache.json by default)
-const defaultCachePath = path.resolve(__dirname, '..', 'cache', 'version_cache.json');
+const defaultCachePath = path.resolve(defaultCacheDir, 'version_cache.json');
 const rootCachePath = path.resolve(__dirname, '..', '..', 'version_cache.json');
 const oldGithubCachePath = path.resolve(__dirname, '..', 'version_cache.json');
 const CACHE_FILE = process.env.CACHE_FILE || (
@@ -99,6 +101,35 @@ function writeVersionCache(versionInfo, downloadedFilename = null) {
     fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData, null, 2) + '\n', 'utf8');
     console.log(`Updated repo version cache at ${CACHE_FILE}:`);
     console.log(JSON.stringify(cacheData, null, 2));
+}
+
+/**
+ * Removes older version archives from the cache directory so only the latest version is retained.
+ */
+function cleanupOldCachedFiles(currentSafeFilename) {
+    try {
+        if (!fs.existsSync(OUTPUT_DIR)) return;
+        const files = fs.readdirSync(OUTPUT_DIR);
+        const archiveExtensions = ['.zip', '.rar', '.7z', '.tar', '.gz'];
+        for (const file of files) {
+            // Never delete version_cache.json or sha256 checksums
+            if (file === 'version_cache.json' || file.endsWith('.sha256')) {
+                continue;
+            }
+            const ext = path.extname(file).toLowerCase();
+            if (archiveExtensions.includes(ext) && file !== currentSafeFilename) {
+                const filePath = path.join(OUTPUT_DIR, file);
+                console.log(`Removing old version archive from cache: ${file}`);
+                try {
+                    fs.unlinkSync(filePath);
+                } catch (err) {
+                    console.warn(`  Warning: Could not remove old file ${file}: ${err.message}`);
+                }
+            }
+        }
+    } catch (e) {
+        console.warn(`  Warning: Could not cleanup old cached files: ${e.message}`);
+    }
 }
 
 // --- Version Parsing & Futureproof Matching Engine ---
@@ -1173,6 +1204,9 @@ function downloadFile(url, redirectCount = 0) {
     console.log(`\nInitiating file download: ${downloadUrl}`);
     const destinationPath = await downloadFile(downloadUrl);
     const safeFilename = path.basename(destinationPath);
+
+    // Remove older version archives from cache directory
+    cleanupOldCachedFiles(safeFilename);
 
     // Step 6: Update repo cache JSON (rinFetch = true)
     writeVersionCache(officialVersion, safeFilename);
