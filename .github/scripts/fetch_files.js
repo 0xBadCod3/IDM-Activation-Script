@@ -11,13 +11,25 @@ const TOPIC_URL = process.env.RINRU_TOPIC || 'https://cs.rin.ru/forum/viewtopic.
 const POST_AUTHOR = (process.env.RINRU_AUTHOR || 'LuKeStorm').trim();
 const SECTION_KEYWORD = (process.env.RINRU_SECTION || 'Fix').trim();
 const OUTPUT_DIR = process.env.OUTPUT_DIR || path.resolve(__dirname, '..', '..', 'downloads');
+const FORCE_FETCH = (process.env.FORCE_FETCH || '').toLowerCase() === 'true';
+
+// Cache file configuration (.github/cache/version_cache.json by default)
+const defaultCachePath = path.resolve(__dirname, '..', 'cache', 'version_cache.json');
+const rootCachePath = path.resolve(__dirname, '..', '..', 'version_cache.json');
+const oldGithubCachePath = path.resolve(__dirname, '..', 'version_cache.json');
+const CACHE_FILE = process.env.CACHE_FILE || (
+    fs.existsSync(defaultCachePath) ? defaultCachePath :
+    fs.existsSync(rootCachePath) ? rootCachePath :
+    fs.existsSync(oldGithubCachePath) ? oldGithubCachePath :
+    defaultCachePath
+);
 
 const USERNAME = process.env.RINRU_USER || '';
 const PASSWORD = process.env.RINRU_PASS || '';
 const SAVED_COOKIE = process.env.RINRU_SESSION || '';
 const COOKIE_OUTPUT_FILE = process.env.COOKIE_OUTPUT_FILE || '';
 
-// --- GitHub Actions Secret Masking ---
+// --- GitHub Actions Secret Masking & Output ---
 
 /**
  * Registers a secret with GitHub Actions runner log scrubber so it is masked as ***.
@@ -28,16 +40,23 @@ function maskSecretInActions(secret) {
     }
 }
 
+/**
+ * Exports key-value pairs to $GITHUB_OUTPUT for workflow step chaining.
+ */
+function setGithubOutput(key, value) {
+    if (process.env.GITHUB_OUTPUT) {
+        try {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
+        } catch {
+            // Ignore if running outside GHA
+        }
+    }
+}
+
 // Mask known credentials immediately upon startup
 if (PASSWORD) maskSecretInActions(PASSWORD);
 if (USERNAME) maskSecretInActions(USERNAME);
 if (SAVED_COOKIE) maskCookieValues(SAVED_COOKIE);
-
-// Validate credentials if no saved session is provided
-if (!SAVED_COOKIE && (!USERNAME || !PASSWORD)) {
-    console.error('Error: RINRU_USER and RINRU_PASS env vars are required when RINRU_SESSION is not set.');
-    process.exit(1);
-}
 
 if (!fs.existsSync(OUTPUT_DIR)) {
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -49,6 +68,117 @@ const FORUM_HOST = 'cs.rin.ru';
 
 // Shared in-memory cookie jar
 let activeCookies = SAVED_COOKIE || '';
+
+// --- Version Cache Helpers ---
+
+function readVersionCache() {
+    if (!fs.existsSync(CACHE_FILE)) {
+        return null;
+    }
+    try {
+        const raw = fs.readFileSync(CACHE_FILE, 'utf8');
+        return JSON.parse(raw);
+    } catch (e) {
+        console.warn(`  Warning: Could not parse version cache at ${CACHE_FILE}: ${e.message}`);
+        return null;
+    }
+}
+
+function writeVersionCache(versionInfo, downloadedFilename = null) {
+    const dir = path.dirname(CACHE_FILE);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+    const cacheData = {
+        latestVersion: versionInfo.normalized,
+        rawVersion: versionInfo.raw,
+        rinFetch: true,
+        lastUpdated: new Date().toISOString(),
+        downloadedFile: downloadedFilename || undefined,
+    };
+    fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData, null, 2) + '\n', 'utf8');
+    console.log(`Updated repo version cache at ${CACHE_FILE}:`);
+    console.log(JSON.stringify(cacheData, null, 2));
+}
+
+// --- Official IDM Website Scraper ---
+
+function parseIdmVersion(rawVersion) {
+    if (!rawVersion) return null;
+    const clean = rawVersion.trim();
+    const m = clean.match(/(\d+\.\d+)(?:\s*(?:build|\.)\s*(\d+))?/i);
+    if (!m) return null;
+    const majorMinor = m[1];
+    const build = m[2] || '0';
+    const normalized = build !== '0' ? `${majorMinor} Build ${build}` : majorMinor;
+    return {
+        raw: clean,
+        normalized,
+        majorMinor,
+        build,
+    };
+}
+
+async function fetchLatestOfficialIdmVersion() {
+    console.log('Checking official IDM website for latest release (https://www.internetdownloadmanager.com/news.html)...');
+    const res = await request('https://www.internetdownloadmanager.com/news.html');
+    if (res.statusCode !== 200) {
+        throw new Error(`Failed to fetch IDM news page, HTTP status: ${res.statusCode}`);
+    }
+
+    // Match primary header: <H3>What's new in version 6.43 Build 10</H3>
+    const h3Match = res.body.match(/<h3[^>]*>\s*What['’]?s\s+new\s+in\s+version\s+([^<]+)<\/h3>/i);
+    let rawVersion = h3Match ? h3Match[1].trim() : null;
+
+    // Fallback: match download link e.g. idman643build10.exe
+    if (!rawVersion) {
+        const exeMatch = res.body.match(/idman(\d{1,2})(\d{2})(?:build(\d+))?\.exe/i);
+        if (exeMatch) {
+            const major = exeMatch[1];
+            const minor = exeMatch[2];
+            const build = exeMatch[3];
+            rawVersion = build ? `${major}.${minor} Build ${build}` : `${major}.${minor}`;
+        }
+    }
+
+    if (!rawVersion) {
+        throw new Error('Could not parse latest IDM version from news.html');
+    }
+
+    const versionObj = parseIdmVersion(rawVersion);
+    if (!versionObj) {
+        throw new Error(`Unrecognized IDM version format: "${rawVersion}"`);
+    }
+
+    console.log(`  Latest official IDM version detected: "${versionObj.normalized}"`);
+    return versionObj;
+}
+
+/**
+ * Checks whether a post HTML or attachment text matches the target version.
+ */
+function postMatchesVersion(postHtml, targetVersion) {
+    if (!targetVersion || !targetVersion.majorMinor) return true;
+    const verEscaped = targetVersion.majorMinor.replace(/\./g, '\\.');
+
+    if (targetVersion.build && targetVersion.build !== '0') {
+        const buildEscaped = targetVersion.build;
+        const patterns = [
+            // "6.43 Build 10", "6.43 build 10", "6.43_Build_10", "6.43.Build.10", "6.43-Build-10"
+            new RegExp(`${verEscaped}[\\s._-]*build[\\s._-]*${buildEscaped}\\b`, 'i'),
+            // "6.43.10" or "6.43_10"
+            new RegExp(`${verEscaped}[._]${buildEscaped}\\b`, 'i'),
+            // "idman643build10"
+            new RegExp(`idman${targetVersion.majorMinor.replace(/\./g, '')}build${buildEscaped}`, 'i'),
+            // "6.43" followed within 150 chars by "build 10"
+            new RegExp(`${verEscaped}[\\s\\S]{0,150}?\\bbuild[\\s._-]*${buildEscaped}\\b`, 'i'),
+        ];
+        return patterns.some(p => p.test(postHtml));
+    } else {
+        const pattern = new RegExp(`\\bv?${verEscaped}\\b`, 'i');
+        return pattern.test(postHtml);
+    }
+}
 
 // --- Security & Cookie Helpers ---
 
@@ -538,23 +668,40 @@ function extractDownloadLinksFromPost(postHtml) {
 }
 
 /**
- * Finds the most relevant download link matching the target section keyword (e.g. 'Fix').
+ * Finds the most relevant download link matching the target section keyword (e.g. 'Fix') and target version.
  */
-function findBestDownloadLink(postHtml, sectionKeyword) {
+function findBestDownloadLink(postHtml, sectionKeyword, targetVersion = null) {
     const allLinks = extractDownloadLinksFromPost(postHtml);
     if (allLinks.length === 0) return null;
     if (allLinks.length === 1) return allLinks[0];
 
     const kwLower = sectionKeyword.toLowerCase();
 
-    // 1. Direct match on anchor text / attachment filename (e.g. "IDM_6.42_Fix.rar")
+    // 1. First priority: link whose anchor text contains BOTH the section keyword (e.g. Fix) AND matches targetVersion
+    if (targetVersion) {
+        const versionAndKwMatch = allLinks.find(l => 
+            l.anchorText.toLowerCase().includes(kwLower) && postMatchesVersion(l.anchorText, targetVersion)
+        );
+        if (versionAndKwMatch) {
+            console.log(`    Matched link matching section and version: "${versionAndKwMatch.anchorText}"`);
+            return versionAndKwMatch;
+        }
+
+        const versionMatch = allLinks.find(l => postMatchesVersion(l.anchorText, targetVersion));
+        if (versionMatch) {
+            console.log(`    Matched link matching target version in anchor text: "${versionMatch.anchorText}"`);
+            return versionMatch;
+        }
+    }
+
+    // 2. Direct match on anchor text / attachment filename (e.g. "IDM_6.43_Fix.rar")
     const anchorMatch = allLinks.find(l => l.anchorText.toLowerCase().includes(kwLower));
     if (anchorMatch) {
         console.log(`    Matched link by filename/anchor text: "${anchorMatch.anchorText}"`);
         return anchorMatch;
     }
 
-    // 2. Section heading match: find heading containing keyword, then look for links in that section
+    // 3. Section heading match: find heading containing keyword, then look for links in that section
     const headingRegex = /<(?:b|strong|span|h[1-6])\b[^>]*>([\s\S]*?)<\/(?:b|strong|span|h[1-6])>/gi;
     let h;
     while ((h = headingRegex.exec(postHtml)) !== null) {
@@ -571,7 +718,7 @@ function findBestDownloadLink(postHtml, sectionKeyword) {
         }
     }
 
-    // 3. Text proximity fallback
+    // 4. Text proximity fallback
     const text = stripHtml(postHtml).toLowerCase();
     const kwIdx = text.indexOf(kwLower);
     if (kwIdx !== -1) {
@@ -630,10 +777,14 @@ function parsePaginationInfo(html) {
 
 /**
  * Searches topic pages to locate the author's post containing the target section and download link.
+ * If targetVersion is provided, ensures the post matches the target version.
  */
-async function findDownloadLink() {
+async function findDownloadLink(targetVersion = null) {
     console.log(`\nNavigating topic: ${TOPIC_URL}`);
     console.log(`Target Author: "${POST_AUTHOR}" | Section: "${SECTION_KEYWORD}"`);
+    if (targetVersion) {
+        console.log(`Target Version to Match: "${targetVersion.normalized}"`);
+    }
 
     const parsed = new URL(TOPIC_URL);
     const f = parsed.searchParams.get('f') || '14';
@@ -645,6 +796,7 @@ async function findDownloadLink() {
     let maxStart = initialStart;
     let pagesChecked = 0;
     const MAX_PAGES_TO_SCAN = 60;
+    let foundAuthorPost = false;
 
     while (pagesChecked < MAX_PAGES_TO_SCAN) {
         const pageUrl = `https://cs.rin.ru/forum/viewtopic.php?f=${f}&t=${t}&start=${start}`;
@@ -675,11 +827,18 @@ async function findDownloadLink() {
         });
 
         if (authorPosts.length > 0) {
+            foundAuthorPost = true;
             console.log(`  Found ${authorPosts.length} post(s) by "${POST_AUTHOR}" on this page.`);
 
             // Search through author's posts for the section & download link
             for (const post of authorPosts) {
-                const bestLink = findBestDownloadLink(post.html, SECTION_KEYWORD);
+                // If targetVersion is provided, verify whether this post matches targetVersion
+                if (targetVersion && !postMatchesVersion(post.html, targetVersion)) {
+                    console.log(`  Post by "${POST_AUTHOR}" does not match target version "${targetVersion.normalized}".`);
+                    continue;
+                }
+
+                const bestLink = findBestDownloadLink(post.html, SECTION_KEYWORD, targetVersion);
                 if (bestLink) {
                     console.log(`  Selected download link: ${bestLink.url}`);
                     return bestLink.url;
@@ -695,8 +854,12 @@ async function findDownloadLink() {
         start += perPage;
     }
 
-    console.error(`\nError: Could not find download link by author "${POST_AUTHOR}" for section "${SECTION_KEYWORD}".`);
-    process.exit(1);
+    if (foundAuthorPost && targetVersion) {
+        console.log(`\nAuthor "${POST_AUTHOR}" post(s) were found, but none match required version "${targetVersion.normalized}".`);
+    } else {
+        console.log(`\nCould not find download link by author "${POST_AUTHOR}" for section "${SECTION_KEYWORD}".`);
+    }
+    return null;
 }
 
 // --- File Downloader ---
@@ -807,19 +970,6 @@ function downloadFile(url, redirectCount = 0) {
                 const fileWriteStream = fs.createWriteStream(destinationPath);
                 await pipeline(res, fileWriteStream);
                 console.log(`\nDownload completed. Saved to: ${destinationPath}`);
-
-                // Export output for GitHub Actions workflow chaining
-                if (process.env.GITHUB_OUTPUT) {
-                    try {
-                        fs.appendFileSync(
-                            process.env.GITHUB_OUTPUT,
-                            `downloaded_file=${destinationPath}\nfilename=${safeFilename}\n`
-                        );
-                    } catch {
-                        // Ignore if running outside GHA
-                    }
-                }
-
                 resolve(destinationPath);
             } catch (err) {
                 fs.unlink(destinationPath, () => {});
@@ -839,7 +989,35 @@ function downloadFile(url, redirectCount = 0) {
 // --- Main Execution Flow ---
 
 (async () => {
-    // Step 1: Attempt to use saved session cookie if available
+    // Step 1: Check official IDM website for the latest release
+    const officialVersion = await fetchLatestOfficialIdmVersion();
+    const cache = readVersionCache();
+
+    // Step 2: Compare against local repo cache
+    let needsFetch = false;
+    if (FORCE_FETCH) {
+        console.log('FORCE_FETCH is enabled. Forcing RIN forum check regardless of cache.');
+        needsFetch = true;
+    } else if (!cache) {
+        console.log(`No existing version cache found at ${CACHE_FILE}. Proceeding to check RIN forum.`);
+        needsFetch = true;
+    } else if (cache.latestVersion !== officialVersion.normalized) {
+        console.log(`New official IDM version detected! Official: "${officialVersion.normalized}", Cached: "${cache.latestVersion}".`);
+        needsFetch = true;
+    } else if (cache.rinFetch !== true) {
+        console.log(`Official version "${officialVersion.normalized}" matches cache, but rinFetch is not true. Proceeding to check RIN forum.`);
+        needsFetch = true;
+    } else {
+        console.log(`\nOfficial version "${officialVersion.normalized}" is already cached and fetched (rinFetch: true).`);
+        console.log('Skipping RIN access. All files are up to date.');
+        setGithubOutput('downloaded', 'false');
+        setGithubOutput('cache_updated', 'false');
+        setGithubOutput('version', officialVersion.normalized);
+        process.exit(0);
+    }
+
+    // Step 3: Access RIN Forum if new version is needed
+    console.log('\nProceeding to check RIN forum for new version...');
     let sessionValid = false;
     if (activeCookies) {
         console.log('Validating saved session cookie...');
@@ -851,7 +1029,6 @@ function downloadFile(url, redirectCount = 0) {
         }
     }
 
-    // Step 2: Authenticate if no active session
     if (!sessionValid) {
         if (!USERNAME || !PASSWORD) {
             console.error('Error: Session cookie expired and no RINRU_USER / RINRU_PASS provided for re-login.');
@@ -861,12 +1038,34 @@ function downloadFile(url, redirectCount = 0) {
         await login();
     }
 
-    // Step 3: Locate the target download URL from topic
-    const downloadUrl = await findDownloadLink();
+    // Step 4: Locate target download URL matching official version
+    const downloadUrl = await findDownloadLink(officialVersion);
 
-    // Step 4: Download and save the file safely
+    if (!downloadUrl) {
+        console.log(`\nRIN forum post has not yet updated to version "${officialVersion.normalized}".`);
+        console.log('Per requirements: doing nothing and leaving repo cache unchanged until RIN updates.');
+        setGithubOutput('downloaded', 'false');
+        setGithubOutput('cache_updated', 'false');
+        setGithubOutput('version', officialVersion.normalized);
+        process.exit(0);
+    }
+
+    // Step 5: Download and save the file safely
     console.log(`\nInitiating file download: ${downloadUrl}`);
-    await downloadFile(downloadUrl);
+    const destinationPath = await downloadFile(downloadUrl);
+    const safeFilename = path.basename(destinationPath);
+
+    // Step 6: Update repo cache JSON (rinFetch = true)
+    writeVersionCache(officialVersion, safeFilename);
+
+    // Step 7: Export outputs for GitHub Actions
+    setGithubOutput('downloaded', 'true');
+    setGithubOutput('cache_updated', 'true');
+    setGithubOutput('version', officialVersion.normalized);
+    setGithubOutput('downloaded_file', destinationPath);
+    setGithubOutput('filename', safeFilename);
+
+    console.log('\nProcess completed successfully.');
 
 })().catch((err) => {
     console.error(`\nProcess failed: ${err.message}`);

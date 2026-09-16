@@ -5,6 +5,11 @@ on:
     - cron: '0 0 */2 * *'
   workflow_dispatch:
     inputs:
+      force:
+        description: 'Force fetch from RIN regardless of cache'
+        required: false
+        default: 'false'
+        type: boolean
       topic_url:
         description: 'Topic URL'
         required: false
@@ -22,7 +27,7 @@ jobs:
   download:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       actions: write
     steps:
       - name: Checkout repository
@@ -43,21 +48,26 @@ jobs:
           RINRU_TOPIC: ${{ inputs.topic_url || 'https://cs.rin.ru/forum/viewtopic.php?f=14&t=27045' }}
           RINRU_SECTION: ${{ inputs.section || 'Fix' }}
           RINRU_AUTHOR: ${{ inputs.author || 'LuKeStorm' }}
+          FORCE_FETCH: ${{ inputs.force || 'false' }}
           COOKIE_OUTPUT_FILE: ${{ runner.temp }}/.rin_cookie
 
       - name: Persist session cookie
         if: always()
+        continue-on-error: true
         run: |
           COOKIE_FILE="${{ runner.temp }}/.rin_cookie"
           if [ -f "$COOKIE_FILE" ]; then
             if [ -n "$PAT_TOKEN" ]; then
               echo "Updating RINRU_SESSION secret..."
-              gh secret set RINRU_SESSION < "$COOKIE_FILE"
-              echo "RINRU_SESSION secret updated successfully."
+              if gh secret set RINRU_SESSION < "$COOKIE_FILE"; then
+                echo "RINRU_SESSION secret updated successfully."
+              else
+                echo "::warning::Failed to update RINRU_SESSION secret. Please verify that SECRETS_PAT is valid and not expired."
+              fi
             else
               echo "Notice: SECRETS_PAT / GH_PAT secret is not configured."
               echo "The default GITHUB_TOKEN does not have permissions to modify repository secrets."
-              echo "Session was used for this run. To auto-save refreshed session cookies, set a PAT in secrets.SECRETS_PAT."
+              echo "To auto-save refreshed session cookies, configure a PAT in secrets.SECRETS_PAT."
             fi
             rm -f "$COOKIE_FILE"
           fi
@@ -65,8 +75,17 @@ jobs:
           GH_TOKEN: ${{ secrets.SECRETS_PAT || secrets.GH_PAT || '' }}
           PAT_TOKEN: ${{ secrets.SECRETS_PAT || secrets.GH_PAT || '' }}
 
+      - name: Commit version cache
+        if: steps.fetch-step.outputs.cache_updated == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add .github/cache/version_cache.json
+          git diff --cached --quiet || git commit -m "Update IDM version cache to ${{ steps.fetch-step.outputs.version }} [skip ci]"
+          git push
+
       - name: Prune older artifacts
-        if: success()
+        if: steps.fetch-step.outputs.downloaded == 'true'
         continue-on-error: true
         run: |
           echo "Cleaning up older 'idm-download' artifacts from previous runs..."
@@ -81,7 +100,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifact
-        if: success()
+        if: steps.fetch-step.outputs.downloaded == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: idm-download
