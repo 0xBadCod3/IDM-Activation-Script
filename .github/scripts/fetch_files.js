@@ -101,24 +101,136 @@ function writeVersionCache(versionInfo, downloadedFilename = null) {
     console.log(JSON.stringify(cacheData, null, 2));
 }
 
-// --- Official IDM Website Scraper ---
+// --- Version Parsing & Futureproof Matching Engine ---
 
-function parseIdmVersion(rawVersion) {
-    if (!rawVersion) return null;
-    const clean = rawVersion.trim();
-    const m = clean.match(/(\d+\.\d+)(?:\s*(?:build|\.)\s*(\d+))?/i);
-    if (!m) return null;
-    const majorMinor = m[1];
-    const build = m[2] || '0';
-    const normalized = build !== '0' ? `${majorMinor} Build ${build}` : majorMinor;
-    return {
-        raw: clean,
-        normalized,
-        majorMinor,
-        build,
-    };
+/**
+ * Compares two parsed versions mathematically.
+ * Returns > 0 if a > b, < 0 if a < b, 0 if equal.
+ */
+function compareVersions(a, b) {
+    if (!a && !b) return 0;
+    if (!a) return -1;
+    if (!b) return 1;
+    if (a.major !== b.major) return a.major - b.major;
+    if (a.minor !== b.minor) return a.minor - b.minor;
+    return (a.build || 0) - (b.build || 0);
 }
 
+/**
+ * Checks if two versions are semantically identical (major, minor, and build match).
+ */
+function areVersionsEqual(a, b) {
+    if (!a || !b) return false;
+    return a.major === b.major && a.minor === b.minor && (a.build || 0) === (b.build || 0);
+}
+
+/**
+ * Canonical display string for a version: e.g. "6.43 Build 10" or "6.44".
+ */
+function formatVersion(v) {
+    if (!v) return '';
+    return (v.build && v.build > 0) ? `${v.major}.${v.minor} Build ${v.build}` : `${v.major}.${v.minor}`;
+}
+
+/**
+ * Extracts all valid IDM versions from any arbitrary text, HTML, or filename.
+ * Robust against varied naming schemes (e.g. 6.43 Build 10, 6.43.10, 6.43b10, IDM_6.43_b10_fix, idman643build10.exe)
+ * and safely ignores non-IDM versions (e.g. Windows 8.1, Chrome 31).
+ */
+function extractAllVersions(text) {
+    if (!text || typeof text !== 'string') return [];
+    const versions = [];
+    const seen = new Set();
+
+    function addVersion(majorStr, minorStr, buildStr, rawStr) {
+        const major = parseInt(majorStr, 10);
+        const minor = parseInt(minorStr, 10);
+        const build = buildStr ? parseInt(buildStr, 10) : 0;
+
+        // Valid IDM major version bounds (currently v6.x, allowing future v7-v30)
+        if (isNaN(major) || major < 5 || major > 30) return;
+        if (isNaN(minor) || minor < 0 || minor > 99) return;
+        if (isNaN(build) || build < 0 || build > 999) return;
+
+        const key = `${major}.${minor}.${build}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            const normalized = formatVersion({ major, minor, build });
+            versions.push({
+                major,
+                minor,
+                build,
+                majorMinor: `${major}.${minor}`,
+                raw: rawStr ? rawStr.trim() : normalized,
+                normalized,
+            });
+        }
+    }
+
+    // Pattern 1: Download executable names e.g. idman643build10.exe, idman643b10.exe, idman643.exe
+    const exeRegex = /(?:^|[^0-9a-zA-Z])idman(\d{1,2})(\d{2})(?:(?:build|b)(\d{1,3}))?(?![0-9a-zA-Z])/gi;
+    let m;
+    while ((m = exeRegex.exec(text)) !== null) {
+        addVersion(m[1], m[2], m[3], m[0]);
+    }
+
+    // Pattern 2: Explicit IDM prefix or version prefix e.g. 'IDM 6.43', 'IDM_6_43', 'version 6.43'
+    const idmPrefixRegex = /(?:idm|idman|version|ver|v\.)[._\s-]*v?(\d{1,2})[._-](\d{1,2})(?:[._\s-]*(?:build|b|rev)[._\s-]*(\d{1,3})|[._-](\d{1,3}))?(?![0-9a-zA-Z])/gi;
+    while ((m = idmPrefixRegex.exec(text)) !== null) {
+        addVersion(m[1], m[2], m[3] || m[4], m[0]);
+    }
+
+    // Pattern 3: With explicit build/b keyword e.g. '6.43 Build 10', 'v6.43 b10', '6.43-Build-10', '6.43_b10'
+    const buildRegex = /(?:^|[^0-9a-zA-Z])v?(\d{1,2})\.(\d{1,2})[.\s_-]*(?:build|b|rev)[.\s_-]*(\d{1,3})(?![0-9a-zA-Z])/gi;
+    while ((m = buildRegex.exec(text)) !== null) {
+        addVersion(m[1], m[2], m[3], m[0]);
+    }
+
+    // Pattern 4: Generic X.YY.ZZ or X.YY without OS/browser prefix
+    // Matches '6.43.10' or 'v6.43.10' or '6.44' while safely ignoring 'Windows 8.1', 'Chrome 31'
+    const genericRegex = /(?:^|[^0-9a-zA-Z])([a-zA-Z]+[\s_-]*)?v?(\d{1,2})\.(\d{1,2})(?:\.(\d{1,3}))?(?![0-9a-zA-Z])/gi;
+    const osBlacklist = /^(?:windows|win|macos|mac|chrome|firefox|ie|edge|opera|android|ios|ubuntu|debian|linux)$/i;
+    while ((m = genericRegex.exec(text)) !== null) {
+        const prefixWord = (m[1] || '').trim().toLowerCase();
+        if (prefixWord && osBlacklist.test(prefixWord)) {
+            continue;
+        }
+        addVersion(m[2], m[3], m[4], m[0]);
+    }
+
+    return versions;
+}
+
+/**
+ * Finds the highest IDM version contained anywhere within a text or HTML page.
+ */
+function findHighestVersion(text) {
+    const all = extractAllVersions(text);
+    if (all.length === 0) return null;
+    all.sort((a, b) => compareVersions(b, a));
+    return all[0];
+}
+
+/**
+ * Parses any raw string into a structured IDM version object.
+ */
+function parseIdmVersion(rawVersion) {
+    if (!rawVersion) return null;
+    const clean = String(rawVersion).trim();
+    const versions = extractAllVersions(clean);
+    if (versions.length > 0) {
+        versions.sort((a, b) => compareVersions(b, a));
+        return versions[0];
+    }
+    return null;
+}
+
+/**
+ * Scrapes the official Tonec IDM news page for the latest release version.
+ * Utilizes multi-layer detection:
+ * 1. Primary headline pattern ("What's new in version...")
+ * 2. Universal page scanner taking the highest release version found
+ */
 async function fetchLatestOfficialIdmVersion() {
     console.log('Checking official IDM website for latest release (https://www.internetdownloadmanager.com/news.html)...');
     const res = await request('https://www.internetdownloadmanager.com/news.html');
@@ -126,28 +238,26 @@ async function fetchLatestOfficialIdmVersion() {
         throw new Error(`Failed to fetch IDM news page, HTTP status: ${res.statusCode}`);
     }
 
-    // Match primary header: <H3>What's new in version 6.43 Build 10</H3>
-    const h3Match = res.body.match(/<h3[^>]*>\s*What['’]?s\s+new\s+in\s+version\s+([^<]+)<\/h3>/i);
-    let rawVersion = h3Match ? h3Match[1].trim() : null;
+    let versionObj = null;
 
-    // Fallback: match download link e.g. idman643build10.exe
-    if (!rawVersion) {
-        const exeMatch = res.body.match(/idman(\d{1,2})(\d{2})(?:build(\d+))?\.exe/i);
-        if (exeMatch) {
-            const major = exeMatch[1];
-            const minor = exeMatch[2];
-            const build = exeMatch[3];
-            rawVersion = build ? `${major}.${minor} Build ${build}` : `${major}.${minor}`;
-        }
+    // Layer 1: Headline match (e.g. <H3>What's new in version 6.43 Build 10</H3>)
+    const headingMatch = res.body.match(/<(?:h[1-6]|b|strong|div|p)[^>]*>\s*What['’]?s\s+new\s+in\s+version\s+([^<]+)<\/(?:h[1-6]|b|strong|div|p)>/i);
+    if (headingMatch) {
+        versionObj = parseIdmVersion(headingMatch[1]);
     }
 
-    if (!rawVersion) {
-        throw new Error('Could not parse latest IDM version from news.html');
-    }
+    // Layer 2: Universal fallback / validation: scan all releases on news page
+    const highestOnPage = findHighestVersion(res.body);
 
-    const versionObj = parseIdmVersion(rawVersion);
     if (!versionObj) {
-        throw new Error(`Unrecognized IDM version format: "${rawVersion}"`);
+        versionObj = highestOnPage;
+    } else if (highestOnPage && compareVersions(highestOnPage, versionObj) > 0) {
+        console.log(`  Note: found higher release (${highestOnPage.normalized}) on page than headline (${versionObj.normalized}).`);
+        versionObj = highestOnPage;
+    }
+
+    if (!versionObj) {
+        throw new Error('Could not parse latest IDM version from news.html');
     }
 
     console.log(`  Latest official IDM version detected: "${versionObj.normalized}"`);
@@ -155,29 +265,12 @@ async function fetchLatestOfficialIdmVersion() {
 }
 
 /**
- * Checks whether a post HTML or attachment text matches the target version.
+ * Checks whether a post HTML or text snippet contains the specified target version.
  */
 function postMatchesVersion(postHtml, targetVersion) {
-    if (!targetVersion || !targetVersion.majorMinor) return true;
-    const verEscaped = targetVersion.majorMinor.replace(/\./g, '\\.');
-
-    if (targetVersion.build && targetVersion.build !== '0') {
-        const buildEscaped = targetVersion.build;
-        const patterns = [
-            // "6.43 Build 10", "6.43 build 10", "6.43_Build_10", "6.43.Build.10", "6.43-Build-10"
-            new RegExp(`${verEscaped}[\\s._-]*build[\\s._-]*${buildEscaped}\\b`, 'i'),
-            // "6.43.10" or "6.43_10"
-            new RegExp(`${verEscaped}[._]${buildEscaped}\\b`, 'i'),
-            // "idman643build10"
-            new RegExp(`idman${targetVersion.majorMinor.replace(/\./g, '')}build${buildEscaped}`, 'i'),
-            // "6.43" followed within 150 chars by "build 10"
-            new RegExp(`${verEscaped}[\\s\\S]{0,150}?\\bbuild[\\s._-]*${buildEscaped}\\b`, 'i'),
-        ];
-        return patterns.some(p => p.test(postHtml));
-    } else {
-        const pattern = new RegExp(`\\bv?${verEscaped}\\b`, 'i');
-        return pattern.test(postHtml);
-    }
+    if (!targetVersion) return true;
+    const versions = extractAllVersions(postHtml);
+    return versions.some(v => areVersionsEqual(v, targetVersion));
 }
 
 // --- Security & Cookie Helpers ---
@@ -669,75 +762,100 @@ function extractDownloadLinksFromPost(postHtml) {
 
 /**
  * Finds the most relevant download link matching the target section keyword (e.g. 'Fix') and target version.
+ * Ensures that if targetVersion is provided, files belonging to older or different versions are strictly rejected.
  */
 function findBestDownloadLink(postHtml, sectionKeyword, targetVersion = null) {
     const allLinks = extractDownloadLinksFromPost(postHtml);
     if (allLinks.length === 0) return null;
-    if (allLinks.length === 1) return allLinks[0];
 
     const kwLower = sectionKeyword.toLowerCase();
 
-    // 1. First priority: link whose anchor text contains BOTH the section keyword (e.g. Fix) AND matches targetVersion
+    // Map each link with its extracted version metadata
+    const linksWithMeta = allLinks.map(link => {
+        const anchorVersions = extractAllVersions(link.anchorText + ' ' + link.url);
+        const matchesTarget = targetVersion ? anchorVersions.some(v => areVersionsEqual(v, targetVersion)) : true;
+        const hasOtherVersion = targetVersion ? (anchorVersions.length > 0 && !matchesTarget) : false;
+        const hasKeyword = link.anchorText.toLowerCase().includes(kwLower);
+        return {
+            ...link,
+            anchorVersions,
+            matchesTarget,
+            hasOtherVersion,
+            hasKeyword,
+        };
+    });
+
+    // Strategy 1: Link whose filename/anchor text matches BOTH section keyword (e.g. Fix) AND targetVersion
     if (targetVersion) {
-        const versionAndKwMatch = allLinks.find(l => 
-            l.anchorText.toLowerCase().includes(kwLower) && postMatchesVersion(l.anchorText, targetVersion)
-        );
-        if (versionAndKwMatch) {
-            console.log(`    Matched link matching section and version: "${versionAndKwMatch.anchorText}"`);
-            return versionAndKwMatch;
+        const exactMatch = linksWithMeta.find(l => l.matchesTarget && l.hasKeyword);
+        if (exactMatch) {
+            console.log(`    Matched link matching section and version: "${exactMatch.anchorText}"`);
+            return exactMatch;
         }
 
-        const versionMatch = allLinks.find(l => postMatchesVersion(l.anchorText, targetVersion));
+        // Strategy 2: Link whose filename/anchor text matches targetVersion
+        const versionMatch = linksWithMeta.find(l => l.matchesTarget);
         if (versionMatch) {
             console.log(`    Matched link matching target version in anchor text: "${versionMatch.anchorText}"`);
             return versionMatch;
         }
     }
 
-    // 2. Direct match on anchor text / attachment filename (e.g. "IDM_6.43_Fix.rar")
-    const anchorMatch = allLinks.find(l => l.anchorText.toLowerCase().includes(kwLower));
-    if (anchorMatch) {
-        console.log(`    Matched link by filename/anchor text: "${anchorMatch.anchorText}"`);
-        return anchorMatch;
+    // Strategy 3: Link whose anchor text contains section keyword, provided it doesn't belong to a different version
+    const kwMatch = linksWithMeta.find(l => l.hasKeyword && !l.hasOtherVersion);
+    if (kwMatch) {
+        console.log(`    Matched link by filename/anchor text: "${kwMatch.anchorText}"`);
+        return kwMatch;
     }
 
-    // 3. Section heading match: find heading containing keyword, then look for links in that section
+    // Strategy 4: Section heading match - find heading containing keyword, then search for link in that section
     const headingRegex = /<(?:b|strong|span|h[1-6])\b[^>]*>([\s\S]*?)<\/(?:b|strong|span|h[1-6])>/gi;
     let h;
     while ((h = headingRegex.exec(postHtml)) !== null) {
         const headingText = stripHtml(h[1]).toLowerCase();
         if (headingText.includes(kwLower)) {
             const headingPos = h.index;
-            // Search within next 3000 chars after the section header
             const subHtml = postHtml.substring(headingPos, headingPos + 3000);
             const subLinks = extractDownloadLinksFromPost(subHtml);
-            if (subLinks.length > 0) {
-                console.log(`    Matched link in section heading "${stripHtml(h[1])}" -> file ID ${subLinks[0].id}`);
-                return subLinks[0];
+            for (const sl of subLinks) {
+                const slMeta = linksWithMeta.find(l => l.id === sl.id);
+                if (slMeta && !slMeta.hasOtherVersion) {
+                    console.log(`    Matched link in section heading "${stripHtml(h[1])}" -> file ID ${sl.id}`);
+                    return sl;
+                }
             }
         }
     }
 
-    // 4. Text proximity fallback
+    // Strategy 5: Text proximity fallback to sectionKeyword
     const text = stripHtml(postHtml).toLowerCase();
     const kwIdx = text.indexOf(kwLower);
     if (kwIdx !== -1) {
         let bestDist = Infinity;
-        let bestProximityLink = allLinks[0];
-        for (const link of allLinks) {
-            const textBefore = stripHtml(postHtml.substring(0, link.index)).toLowerCase();
+        let bestProximityLink = null;
+        for (const l of linksWithMeta) {
+            if (l.hasOtherVersion) continue;
+            const textBefore = stripHtml(postHtml.substring(0, l.index)).toLowerCase();
             const dist = Math.abs(textBefore.length - kwIdx);
             if (dist < bestDist) {
                 bestDist = dist;
-                bestProximityLink = link;
+                bestProximityLink = l;
             }
         }
-        console.log(`    Matched link by proximity to "${sectionKeyword}" -> file ID ${bestProximityLink.id}`);
-        return bestProximityLink;
+        if (bestProximityLink) {
+            console.log(`    Matched link by proximity to "${sectionKeyword}" -> file ID ${bestProximityLink.id}`);
+            return bestProximityLink;
+        }
     }
 
-    // Default fallback to first link
-    return allLinks[0];
+    // Fallback: If targetVersion is specified, DO NOT pick a link that explicitly has another version
+    const viableLinks = linksWithMeta.filter(l => !l.hasOtherVersion);
+    if (viableLinks.length > 0) {
+        return viableLinks[0];
+    }
+
+    // If all links explicitly belong to different versions, return null
+    return null;
 }
 
 /**
@@ -992,17 +1110,18 @@ function downloadFile(url, redirectCount = 0) {
     // Step 1: Check official IDM website for the latest release
     const officialVersion = await fetchLatestOfficialIdmVersion();
     const cache = readVersionCache();
+    const cachedVersion = cache ? parseIdmVersion(cache.latestVersion || cache.rawVersion) : null;
 
     // Step 2: Compare against local repo cache
     let needsFetch = false;
     if (FORCE_FETCH) {
         console.log('FORCE_FETCH is enabled. Forcing RIN forum check regardless of cache.');
         needsFetch = true;
-    } else if (!cache) {
-        console.log(`No existing version cache found at ${CACHE_FILE}. Proceeding to check RIN forum.`);
+    } else if (!cache || !cachedVersion) {
+        console.log(`No valid existing version cache found at ${CACHE_FILE}. Proceeding to check RIN forum.`);
         needsFetch = true;
-    } else if (cache.latestVersion !== officialVersion.normalized) {
-        console.log(`New official IDM version detected! Official: "${officialVersion.normalized}", Cached: "${cache.latestVersion}".`);
+    } else if (compareVersions(officialVersion, cachedVersion) > 0) {
+        console.log(`New official IDM version detected! Official: "${officialVersion.normalized}", Cached: "${cachedVersion.normalized}".`);
         needsFetch = true;
     } else if (cache.rinFetch !== true) {
         console.log(`Official version "${officialVersion.normalized}" matches cache, but rinFetch is not true. Proceeding to check RIN forum.`);
